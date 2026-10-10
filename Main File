@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Builds docs/index.html: a taste-ranked, distance-grouped Bay Area events page."""
+import json, math, os, re, time, datetime as dt
+from pathlib import Path
+import requests, yaml
+
+ROOT = Path(__file__).parent
+CFG = yaml.safe_load((ROOT / "config.yaml").read_text())
+TODAY = dt.date.today()
+HORIZON = TODAY + dt.timedelta(days=CFG["days_ahead"])
+HOME = (CFG["home"]["lat"], CFG["home"]["lon"])
+UA = {"User-Agent": "Mozilla/5.0 (personal event directory)"}
+KINDS = {"Music": "music", "Film": "film", "Arts & Theatre": "theater"}
+
+def miles(a, b):
+    p1, p2 = math.radians(a[0]), math.radians(b[0])
+    h = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(b[1] - a[1]) / 2) ** 2
+    return 3959 * 2 * math.asin(math.sqrt(h))
+
+def to_date(s):
+    try: return dt.date.fromisoformat(str(s)[:10])
+    except ValueError: return None
+
+# ---------- sources ----------
+def walk_events(node):
+    if isinstance(node, list):
+        for n in node: yield from walk_events(n)
+    elif isinstance(node, dict):
+        t = node.get("@type", "")
+        types = t if isinstance(t, list) else [t]
+        if any(str(x).endswith("Event") for x in types) and node.get("startDate"):
+            yield node
+        for v in node.values():
+            if isinstance(v, (list, dict)): yield from walk_events(v)
+
+def parse_jsonld(html):
+    out = []
+    for blob in re.findall(r'<script[^>]+ld\+json[^>]*>(.*?)</script>', html, re.S | re.I):
+        try: data = json.loads(blob)
+        except ValueError: continue
+        for e in walk_events(data):
+            out.append({"title": str(e.get("name", "")).strip(), "date": to_date(e["startDate"]),
+                        "url": e.get("url", ""), "desc": str(e.get("description", ""))[:400]})
+    return out
+
+def parse_ics(text):
+    text = re.sub(r"\r?\n[ \t]", "", text)
+    out = []
+    for block in text.split("BEGIN:VEVENT")[1:]:
+        f = {m.group(1): m.group(2) for m in re.finditer(r"^([A-Z-]+)[^:\n]*:(.*)$", block, re.M)}
+        d = re.match(r"(\d{4})(\d{2})(\d{2})", f.get("DTSTART", ""))
+        if d: out.append({"title": f.get("SUMMARY", "").strip(), "date": dt.date(*map(int, d.groups())),
+                          "url": f.get("URL", ""), "desc": f.get("DESCRIPTION", "")[:400]})
+    return out
+
+def scrape_venue(v):
+    r = requests.get(v["url"], headers=UA, timeout=20); r.raise_for_status()
+    raw = parse_ics(r.text) if v["type"] == "ics" else parse_jsonld(r.text)
+    return [{**e, "venue": v["name"], "lat": v["lat"], "lon": v["lon"], "kind": v["kind"],
+             "vweight": v["weight"], "source": "venue"} for e in raw if e["title"]]
+
+def ticketmaster(key, params):
+    r = requests.get("https://app.ticketmaster.com/discovery/v2/events.json", timeout=20, params={
+        "apikey": key, "latlong": f"{HOME[0]},{HOME[1]}", "radius": CFG["max_miles"], "unit": "miles",
+        "size": 50, "sort": "date,asc", "startDateTime": TODAY.isoformat() + "T00:00:00Z",
+        "endDateTime": HORIZON.isoformat() + "T23:59:59Z", **params})
+    r.raise_for_status()
+    return r.json().get("_embedded", {}).get("events", [])
+
+def tm_normalize(e):
+    vs = (e.get("_embedded", {}).get("venues") or [{}])[0]
+    loc = vs.get("location", {})
+    if not loc.get("latitude"): return None
+    seg = (e.get("classifications") or [{}])[0].get("segment", {}).get("name", "")
+    return {"title": e["name"], "date": to_date(e["dates"]["start"].get("localDate")), "url": e.get("url", ""),
+            "desc": "", "venue": vs.get("name", ""), "lat": float(loc["latitude"]), "lon": float(loc["longitude"]),
+            "kind": KINDS.get(seg, "music"), "vweight": 0, "source": "ticketmaster",
+            "attractions": [a["name"].lower() for a in e.get("_embedded", {}).get("attractions", [])]}
+
+def fetch_all(report):
+    events = []
+    for v in CFG["venues"]:
+        try:
+            got = scrape_venue(v)
+            events += got
+            if not got: report.append(f"{v['name']}: page loaded but no structured events found (fix url/type in config.yaml)")
+        except Exception as ex:
+            report.append(f"{v['name']}: {type(ex).__name__}")
+    key = os.environ.get("TICKETMASTER_KEY")
+    if not key:
+        report.append("Ticketmaster: TICKETMASTER_KEY not set, concert search skipped"); return events
+    names = [str(n) for n in CFG["artists"]["top"] + CFG["artists"]["more"]]
+    try:
+        raw = [e for n in names for e in (time.sleep(0.25) or ticketmaster(key, {"keyword": n}))]
+        raw += ticketmaster(key, {"classificationName": "classical"})
+    except Exception as ex:
+        report.append(f"Ticketmaster: {type(ex).__name__}"); return events
+    for e in raw:
+        n = tm_normalize(e)
+        if n: events.append(n)
+    return events
+
+# ---------- scoring ----------
+def score(e):
+    text = f"{e['title']} {e.get('desc','')}".lower()
+    why, s = [], e["vweight"]
+    for i, a in enumerate(map(str, CFG["artists"]["top"] + CFG["artists"]["more"])):
+        a_l = a.lower()
+        if a_l in e.get("attractions", []) or (e["source"] == "venue" and a_l in text):
+            s += 12 if i < len(CFG["artists"]["top"]) else 8; why.append(a); break
+    for k in CFG["keywords"].get(e["kind"], []) + CFG["keywords"]["music"] * (e["kind"] == "theater"):
+        if k.lower() in text: s += 5; why.append(k); break
+    e["miles"] = round(miles(HOME, (e["lat"], e["lon"])), 1)
+    e["score"] = round(s - min(e["miles"] * 0.05, 3), 2)
+    e["why"] = why
+    return e
+
+def build():
+    report = []
+    events = fetch_all(report)
+    seen, pool = set(), []
+    for e in map(score, events):
+        d = e["date"]
+        k = (e["title"].lower(), str(d), e["venue"].lower())
+        if not d or not (TODAY <= d <= HORIZON) or k in seen or e["miles"] > CFG["max_miles"]: continue
+        if e["source"] == "ticketmaster" and not e["why"]: continue   # only keep concerts that match your taste
+        seen.add(k)
+        pool.append({"title": e["title"], "date": str(d), "url": e["url"], "venue": e["venue"], "kind": e["kind"],
+                     "miles": e["miles"], "score": e["score"], "why": e["why"]})
+    pool.sort(key=lambda e: -e["score"])
+    pool = pool[:400]
+    # new-venue detection (no LLM needed): venues seen via Ticketmaster that we haven't seen before
+    state_f = ROOT / "docs" / "seen_venues.json"
+    known = set(json.loads(state_f.read_text())) if state_f.exists() else None
+    names = {e["venue"] for e in pool}
+    new = sorted(names - known - {v["name"] for v in CFG["venues"]}) if known is not None else []
+    state_f.write_text(json.dumps(sorted((known or set()) | names)))
+    html = (ROOT / "template.html").read_text().replace("__DATA__", json.dumps({
+        "events": pool, "tiers": CFG["tiers"], "zip": CFG["home"]["zip"], "new_venues": new,
+        "report": report, "built": TODAY.isoformat()}).replace("</", "<\\/"))
+    (ROOT / "docs" / "index.html").write_text(html)
+    print(f"{len(pool)} events, {len(report)} source issues, {len(new)} new venues")
+
+if __name__ == "__main__":
+    build()
+
+# Edit this file to change what the directory watches. No code changes needed.
+home: {zip: "94707", lat: 37.9065, lon: -122.2756}
+days_ahead: 90          # how far ahead to list events
+max_miles: 60           # drop anything farther than this from home
+tiers: [10, 25, 60]     # distance groups on the page (miles)
+
+# Concerts: Ticketmaster is searched for each of these (living artists/ensembles).
+artists:
+  top: [Zelooperz, JAY-Z, Kanye West, "454", Jairo, Vince Staples, De La Soul, Tinashe, Geese,
+        Denzel Curry, Kendrick Lamar, Clipse, Flying Lotus, Isaiah Rashad, Earl Sweatshirt,
+        Injury Reserve, MAVI, Tyler The Creator, Dijon, underscores, Berliner Philharmoniker,
+        Wiener Philharmoniker, London Symphony Orchestra, Riccardo Muti, Teodor Currentzis,
+        Daniel Barenboim, Simon Rattle, Roger Norrington]
+  more: [Liim, Future, Frank Ocean, Phoebe Bridgers, Tierra Whack, BROCKHAMPTON, Charli xcx,
+         Bad Brains, Pavement, Young Thug, JUVENILE, Cameron Winter, black midi, Geordie Greep,
+         Nala Sinephro, Kenshi Yonezu, seiji oda, Olivia Rodrigo]
+
+# Words that boost any event whose title/description contains them.
+keywords:
+  music: [Debussy, Stravinsky, Webern, Wagner, Bach, Bernstein, Goldberg, Rite of Spring]
+  film: [Ozu, Kurosawa, Edward Yang, Kiarostami, Wong Kar-wai, Cronenberg, Safdie, Altman,
+         Lumet, Leone, Mizoguchi, Park Chan-wook, Hitchcock, Japanese, Korean, 35mm]
+  reading: [poetry, poet, Dante, Shakespeare, Woolf, Glück, Dickinson, Weil, Robinson,
+            Abdurraqib, Notley, Albert Murray]
+
+# Venues scraped directly. type: jsonld (schema.org Event data in the page) or ics (calendar feed).
+# weight 0-5 = how much you trust the venue. lat/lon are approximate. URLs are best guesses:
+# the page footer lists any venue that returned nothing so you can fix its url here.
+venues:
+  - {name: BAMPFA, kind: film, weight: 5, lat: 37.8688, lon: -122.2677, type: jsonld, url: "https://bampfa.org/visit/calendar"}
+  - {name: Cal Performances, kind: music, weight: 5, lat: 37.8689, lon: -122.2606, type: jsonld, url: "https://calperformances.org/events/"}
+  - {name: Freight & Salvage, kind: music, weight: 3, lat: 37.8714, lon: -122.2682, type: jsonld, url: "https://thefreight.org/calendar/"}
+  - {name: Berkeley Rep, kind: theater, weight: 3, lat: 37.8700, lon: -122.2688, type: jsonld, url: "https://www.berkeleyrep.org/calendar/"}
+  - {name: Shotgun Players, kind: theater, weight: 3, lat: 37.8556, lon: -122.2685, type: jsonld, url: "https://www.shotgunplayers.org/"}
+  - {name: Oakland Museum of California, kind: exhibit, weight: 3, lat: 37.7986, lon: -122.2640, type: jsonld, url: "https://museumca.org/exhibitions/"}
+  - {name: Roxie Theater, kind: film, weight: 5, lat: 37.7647, lon: -122.4183, type: jsonld, url: "https://www.roxie.com/calendar/"}
+  - {name: Castro Theatre, kind: film, weight: 4, lat: 37.7620, lon: -122.4351, type: jsonld, url: "https://www.castrotheatre.com/"}
+  - {name: Vogue Theatre, kind: film, weight: 2, lat: 37.7882, lon: -122.4476, type: jsonld, url: "https://www.voguetheatresf.com/"}
+  - {name: SFJAZZ Center, kind: music, weight: 4, lat: 37.7766, lon: -122.4213, type: jsonld, url: "https://www.sfjazz.org/calendar/"}
+  - {name: SF Symphony (Davies Hall), kind: music, weight: 5, lat: 37.7778, lon: -122.4202, type: jsonld, url: "https://www.sfsymphony.org/Calendar"}
+  - {name: Philharmonia Baroque, kind: music, weight: 4, lat: 37.8000, lon: -122.3000, type: jsonld, url: "https://philharmonia.org/calendar/"}
+  - {name: Gray Area, kind: music, weight: 4, lat: 37.7535, lon: -122.4189, type: jsonld, url: "https://grayarea.org/events/"}
+  - {name: The Lab, kind: exhibit, weight: 4, lat: 37.7650, lon: -122.4116, type: jsonld, url: "https://thelab.org/"}
+  - {name: Asian Art Museum, kind: exhibit, weight: 4, lat: 37.7803, lon: -122.4163, type: jsonld, url: "https://asianart.org/exhibitions/"}
+  - {name: SFMOMA, kind: exhibit, weight: 4, lat: 37.7857, lon: -122.4011, type: jsonld, url: "https://www.sfmoma.org/exhibitions/"}
+  - {name: Japanese Cultural Center of SF, kind: exhibit, weight: 3, lat: 37.7855, lon: -122.4306, type: jsonld, url: "https://jcccnc.org/"}
+  - {name: City Lights Books, kind: reading, weight: 5, lat: 37.7976, lon: -122.4065, type: jsonld, url: "https://citylights.com/events/"}
+  - {name: Green Apple Books, kind: reading, weight: 3, lat: 37.7829, lon: -122.4648, type: jsonld, url: "https://www.greenapplebooks.com/events"}
+  - {name: Moe's Books, kind: reading, weight: 3, lat: 37.8644, lon: -122.2588, type: jsonld, url: "https://moesbooks.com/"}
+
+# Bay Area events, for me
+
+Rebuilds `docs/index.html` every Monday and whenever you run it by hand.
+
+## One-time setup
+1. Create a free Ticketmaster key at developer.ticketmaster.com (copy the "Consumer Key").
+2. On GitHub, create a new **public** repository and upload everything in this folder (keep the `.github` and `docs` folders).
+3. Repo **Settings → Secrets and variables → Actions → New repository secret**: name `TICKETMASTER_KEY`, value = your key.
+4. Repo **Settings → Pages**: Source = "Deploy from a branch", Branch = `main`, folder = `/docs`.
+5. Repo **Actions** tab → "Update events page" → **Run workflow**. After it finishes, your page is at `https://<your-username>.github.io/<repo-name>/`.
+
+## Maintaining it
+- Everything you'd tune lives in `config.yaml` (artists, keywords, venues, distance tiers).
+- The page footer's "Source issues" lists venues that returned nothing. Send me that list and I'll fix the urls.
+- "Not interested" is saved in each browser (not synced between devices).
+
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Bay Area, for me</title>
+<style>
+:root{--bg:#fafaf7;--fg:#1b1b1b;--mut:#6b6b66;--line:#e2e1da;--acc:#8a3b12}
+@media(prefers-color-scheme:dark){:root{--bg:#171715;--fg:#ecebe4;--mut:#9a9990;--line:#33332f;--acc:#e0915f}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 Georgia,serif;max-width:760px;margin:auto;padding:20px 16px 60px}
+h1{font-size:1.5rem;margin:.2em 0}h2{font-size:1.05rem;border-bottom:1px solid var(--line);padding-bottom:4px;margin-top:2em;color:var(--acc)}
+.sub,.meta,.why,footer{color:var(--mut);font:13px system-ui,sans-serif}
+.tabs button,.ev button{font:13px system-ui;border:1px solid var(--line);background:none;color:var(--fg);border-radius:14px;padding:3px 10px;cursor:pointer}
+.tabs button.on{background:var(--fg);color:var(--bg)}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}
+.ev{padding:10px 0;border-bottom:1px solid var(--line)}.ev a{color:var(--fg);font-weight:bold}
+.ev .row{display:flex;justify-content:space-between;gap:10px;align-items:start}
+.why b{color:var(--acc);font-weight:600}</style></head><body>
+<h1>Bay Area, for me</h1><div class="sub" id="sub"></div>
+<div class="tabs" id="tabs"></div><div id="list"></div>
+<h2 id="nvh" hidden>New venues showing up</h2><div id="nv"></div>
+<footer><p id="hid"></p><details><summary>Source issues</summary><ul id="rep"></ul></details></footer>
+<script id="d" type="application/json">__DATA__</script>
+<script>
+const D=JSON.parse(document.getElementById('d').textContent);
+const LS=(k,v)=>{try{if(v===undefined)return JSON.parse(localStorage.getItem(k)||'null');localStorage.setItem(k,JSON.stringify(v))}catch(e){return null}};
+let hidden=new Set(LS('hiddenVenues')||[]),kind='all';const PER=10;
+const el=(t,c,x)=>{const n=document.createElement(t);if(c)n.className=c;if(x!==undefined)n.textContent=x;return n};
+const names={all:'All',music:'Music',film:'Film',exhibit:'Exhibits',reading:'Readings',theater:'Theater'};
+function save(){LS('hiddenVenues',[...hidden]);render()}
+function render(){
+  document.getElementById('sub').textContent=`Near ${D.zip} · updated ${D.built}`;
+  const tabs=document.getElementById('tabs');tabs.replaceChildren();
+  for(const k in names){const b=el('button',k===kind?'on':'',names[k]);b.onclick=()=>{kind=k;render()};tabs.append(b)}
+  const list=document.getElementById('list');list.replaceChildren();
+  const ev=D.events.filter(e=>!hidden.has(e.venue)&&(kind==='all'||e.kind===kind));
+  let lo=0;
+  D.tiers.forEach((hi,i)=>{
+    const g=ev.filter(e=>e.miles>lo&&e.miles<=hi||(i===0&&e.miles<=hi)).slice(0,PER).sort((a,b)=>a.date.localeCompare(b.date));
+    list.append(el('h2','',i===0?`Within ${hi} miles`:`${lo}–${hi} miles`));
+    if(!g.length)list.append(el('div','meta','Nothing matching.'));
+    for(const e of g){
+      const d=el('div','ev'),r=el('div','row'),l=el('div');
+      const a=el('a','',e.title);if(e.url)a.href=e.url;l.append(a);
+      l.append(el('div','meta',`${new Date(e.date+'T12:00').toLocaleDateString(undefined,{weekday:'short',month:'short',day:'numeric'})} · ${e.venue} · ${e.miles} mi`));
+      if(e.why.length){const w=el('div','why','Matches: ');w.append(el('b','',e.why.join(', ')));l.append(w)}
+      const b=el('button','','Not interested');b.title='Hide this venue';b.onclick=()=>{hidden.add(e.venue);save()};
+      r.append(l,b);d.append(r);list.append(d)}
+    lo=hi});
+  const nv=document.getElementById('nv');nv.replaceChildren();
+  document.getElementById('nvh').hidden=!D.new_venues.length;
+  D.new_venues.filter(v=>!hidden.has(v)).forEach(v=>nv.append(el('div','meta',v)));
+  const h=document.getElementById('hid');h.replaceChildren();
+  if(hidden.size){h.append('Hidden venues: ');[...hidden].forEach(v=>{const b=el('button','',v+' ✕');b.style.marginRight='4px';b.onclick=()=>{hidden.delete(v);save()};h.append(b)})}
+  const rep=document.getElementById('rep');rep.replaceChildren();D.report.forEach(r=>rep.append(el('li','',r)));
+}
+render();
+</script></body></html>
